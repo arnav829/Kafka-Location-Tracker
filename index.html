@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Apache Kafka</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+    <link
+        href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap"
+        rel="stylesheet">
+    <script src="https://cdn.tailwindcss.com"></script>
+
+
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+
+        #map {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+        }
+
+        @media (min-width: 768px) {
+            #map {
+                right: 16rem;
+                width: calc(100% - 16rem);
+            }
+        }
+
+        .leaflet-tile-pane {
+            filter: saturate(.5) brightness(.85);
+        }
+
+        @keyframes ping {
+            0% {
+                transform: scale(.4);
+                opacity: .9;
+            }
+
+            100% {
+                transform: scale(2.2);
+                opacity: 0;
+            }
+        }
+    </style>
+
+
+</head>
+
+<body class="bg-[#0a0e13] overflow-hidden text-gray-200">
+
+    <div id="map"></div>
+    <div id="scanlines"
+        class="absolute inset-0 z-[500] pointer-events-none bg-[repeating-linear-gradient(to_bottom,rgba(72,255,176,0.02)_0px,rgba(72,255,176,0.02)_1px,transparent_1px,transparent_3px)]">
+    </div>
+
+    <!-- TOP BAR -->
+
+    <div id="topbar"
+        class="absolute z-[600] top-0 left-0 right-0 h-16 md:h-20 flex items-center justify-between px-3 md:px-6 bg-black text-white">
+        <div id="status" class="flex items-center gap-2 font-mono text-xs tracking-wider text-gray-400">
+            <div id="status-dot" class="w-2 h-2 rounded-full bg-red-500 shadow-[0_0_6px_red]"></div>
+            <span id="status-text">
+                connecting…
+            </span>
+        </div>
+    </div>
+
+
+    <!-- DEVICE PANEL -->
+    <div id="fleet-panel"
+        class="absolute z-[600] top-20 md:top-[72px] left-2 right-2 md:left-auto md:right-4 w-auto md:w-64 max-h-48 md:max-h-[calc(100vh-200px)] overflow-y-auto p-3 md:p-4 bg-[#10161dcc] backdrop-blur-md border border-[#1e2733] rounded-lg">
+        <h2 class="mb-3 font-mono text-[11px] uppercase tracking-[0.14em] text-gray-500">
+            Active devices
+        </h2>
+        <div id="device-list">
+            <span class="font-mono text-xs text-gray-500">
+                Waiting for signal…
+            </span>
+        </div>
+    </div>
+
+
+
+    <!-- FEED PANEL -->
+    <div id="feed-panel"
+        class="absolute z-[600] bottom-2 md:bottom-4 left-2 md:left-4 right-2 md:right-4 h-20 md:h-24 px-3 md:px-4 py-2 bg-[#10161dcc] backdrop-blur-md border border-[#1e2733] rounded-lg font-mono text-[10px] md:text-[11px] text-gray-500 overflow-hidden">
+        <div id="feed-list" class="space-y-1">
+        </div>
+    </div>
+
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+
+    <script>
+        const WS_URL = "ws://localhost:8765";
+        const TRAIL_LENGTH = 40;
+        const STALE_MS = 15000;
+        const map = L.map(
+            'map',
+            {
+                zoomControl: false,
+                attributionControl: false
+            }
+        )
+            .setView(
+                [28.6139, 77.2090],
+                12
+            );
+
+        L.tileLayer(
+            'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+            {
+                subdomains: 'abcd',
+                maxZoom: 19
+            }
+        )
+            .addTo(map);
+
+        const devices = new Map();
+        const palette = [
+            '#48ffb0',
+            '#ffb347',
+            '#5ec8ff',
+            '#ff6b9d',
+            '#c48bff',
+            '#ffe066'
+        ];
+        function colorFor(id) {
+            let hash = 0;
+            for (const ch of id)
+                hash = (hash * 31 + ch.charCodeAt(0)) % palette.length;
+            return palette[hash];
+        }
+
+        function makeMarker(id, lat, lng) {
+            const color = colorFor(id);
+            const icon = L.divIcon({
+                className: '',
+                html: `
+<div style="position:relative;width:22px;height:22px">
+<div style="position:absolute;inset:0;border-radius:50%;background:${color}33;animation:ping 1.8s infinite">
+</div>
+<div style="position:absolute;top:6px;left:6px;width:10px;height:10px;border-radius:50%;background:${color};box-shadow:0 0 8px ${color}">
+</div>
+</div>
+`
+            });
+            return L.marker(
+                [lat, lng],
+                {
+                    icon
+                }
+            )
+                .addTo(map);
+        }
+
+        function updateDevice(event) {
+            const {
+                device_id,
+                lat,
+                lng,
+                speed_kmh
+            } = event;
+            let state = devices.get(device_id);
+            if (!state) {
+                const color = colorFor(device_id);
+                state = {
+                    marker: makeMarker(
+                        device_id,
+                        lat,
+                        lng
+                    ),
+                    trail: [
+                        [lat, lng]
+                    ],
+                    trailLine:
+                        L.polyline(
+                            [[lat, lng]],
+                            {
+                                color,
+                                weight: 2,
+                                opacity: .55
+                            }
+                        )
+                            .addTo(map),
+                    lastSeen: Date.now()
+                };
+                devices.set(
+                    device_id,
+                    state
+                );
+            }
+            else {
+                state.marker.setLatLng(
+                    [lat, lng]
+                );
+                state.trail.push(
+                    [lat, lng]
+                );
+                if (state.trail.length > TRAIL_LENGTH)
+                    state.trail.shift();
+                state.trailLine.setLatLngs(
+                    state.trail
+                );
+                state.lastSeen = Date.now();
+            }
+
+            state.latestEvent = event;
+            renderFleetList();
+        }
+
+        function renderFleetList() {
+            const container = document.getElementById(
+                'device-list'
+            );
+            const rows = [...devices.entries()]
+                .sort(
+                    (a, b) => a[0].localeCompare(b[0])
+                )
+                .map(
+                    ([id, state]) => {
+                        const e = state.latestEvent;
+                        const stale =
+                            Date.now() - state.lastSeen > STALE_MS;
+                        return `
+<div class="flex justify-between items-center py-2 border-t border-[#131b22] font-mono text-xs" style="opacity:${stale ? .35 : 1}">
+<div>
+<div class="text-gray-200 font-medium">
+${id}
+</div>
+<span class="text-[10px] text-gray-500">
+${e.lat.toFixed(4)}, ${e.lng.toFixed(4)}
+</span>
+</div>
+
+<div class="text-[#48ffb0]">
+${e.speed_kmh.toFixed(0)} km/h
+</div>
+</div>
+`;
+                    }
+                );
+            container.innerHTML =
+                rows.length
+                    ?
+                    rows.join('')
+                    :
+                    `
+<span class="text-gray-500 text-xs">
+Waiting for signal…
+</span>
+`;
+        }
+
+        function pushFeedLine(event) {
+            const feed = document.getElementById(
+                'feed-list'
+            );
+            const line = document.createElement('div');
+            line.className =
+                "text-xs whitespace-nowrap overflow-hidden";
+            line.innerHTML = `
+<span class="text-[#48ffb0]">
+${new Date(event.timestamp).toLocaleTimeString()}
+</span>
+<span class="text-[#ffb347]">
+device-locations
+</span>
+${event.device_id}
+→
+(${event.lat.toFixed(5)},${event.lng.toFixed(5)})
+@
+
+${event.speed_kmh.toFixed(1)}
+km/h
+
+`;
+
+            feed.prepend(line);
+            while (feed.childElementCount > 6)
+                feed.removeChild(feed.lastChild);
+        }
+
+        function setStatus(live, text) {
+            document.getElementById(
+                'status-text'
+            )
+                .textContent = text;
+            const dot = document.getElementById(
+                'status-dot'
+            );
+            dot.className =
+                live
+                    ?
+                    "w-2 h-2 rounded-full bg-[#48ffb0] shadow-[0_0_8px_#48ffb0] animate-pulse"
+                    :
+                    "w-2 h-2 rounded-full bg-red-500 shadow-[0_0_6px_red]";
+        }
+
+        function connect() {
+            setStatus(false, 'connecting…');
+            const ws = new WebSocket(
+                WS_URL
+            );
+            ws.onopen = () => setStatus(
+                true,
+                'live'
+            );
+            ws.onclose = () => {
+                setStatus(
+                    false,
+                    'reconnecting…'
+                );
+                setTimeout(
+                    connect,
+                    2000
+                );
+            };
+
+            ws.onerror = () => ws.close();
+            ws.onmessage = (msg) => {
+                const event = JSON.parse(
+                    msg.data
+                );
+                updateDevice(event);
+                pushFeedLine(event);
+            };
+        }
+        connect();
+        setInterval(
+            renderFleetList,
+            3000
+        );
+    </script>
+</body>
+</html>
